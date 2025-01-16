@@ -27,12 +27,12 @@ import (
 )
 
 type Config struct {
-	ServerURL   string
-	Port        string
-	DBPath      string
-	AppviewURL  string
-	FrontendURL string
-	PLCUrl      string
+	ServerHostname string
+	Port           string
+	DBPath         string
+	AppviewURL     string
+	FrontendURL    string
+	PLCUrl         string
 }
 
 type DIDDocument struct {
@@ -462,63 +462,15 @@ func (s *State) getVideo(c *gin.Context) {
 	c.File(filepath.Join(conv.OutputDir, filename))
 }
 
-func requestDebugMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Get the raw request body
-		var bodyBytes []byte
-		if c.Request.Body != nil && c.Request.Header.Get("content-type") == "application/json" {
-			bodyBytes, _ = io.ReadAll(c.Request.Body)
-			// Restore the body for later middleware/handlers
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		} else {
-			bodyBytes = []byte("<stripped data>")
-		}
-
-		// Print request details
-		fmt.Printf("\n==== Incoming Request ====\n")
-		fmt.Printf("Method: %s\n", c.Request.Method)
-		fmt.Printf("URL: %s\n", c.Request.URL.String())
-
-		// Print headers
-		fmt.Println("\nHeaders:")
-		for name, values := range c.Request.Header {
-			fmt.Printf("%s: %s\n", name, strings.Join(values, ", "))
-		}
-
-		// Print query parameters
-		fmt.Println("\nQuery Parameters:")
-		for key, values := range c.Request.URL.Query() {
-			fmt.Printf("%s: %s\n", key, strings.Join(values, ", "))
-		}
-
-		// Print body if exists
-		if len(bodyBytes) > 0 {
-			fmt.Println("\nBody:")
-			// Try to pretty print JSON
-			var prettyJSON bytes.Buffer
-			if err := json.Indent(&prettyJSON, bodyBytes, "", "  "); err == nil {
-				fmt.Println(prettyJSON.String())
-			} else {
-				// If not JSON, print raw body
-				fmt.Println(string(bodyBytes))
-			}
-		}
-
-		fmt.Println("\n========================")
-
-		c.Next()
-	}
-}
-
 func main() {
 	// Initialize configuration
 	config := Config{
-		ServerURL:   getEnvOrDefault("SERVER_URL", "chat.example.net"),
-		Port:        getEnvOrDefault("PORT", "3000"),
-		DBPath:      getEnvOrDefault("DB_PATH", "data.db"),
-		AppviewURL:  getEnvOrDefault("APPVIEW_URL", ""),
-		FrontendURL: getEnvOrDefault("FRONTEND_URL", ""),
-		PLCUrl:      getEnvOrDefault("ATPROTO_PLC_URL", ""),
+		ServerHostname: getEnvOrDefault("SERVER_HOSTNAME", "chat.example.net"),
+		Port:           getEnvOrDefault("PORT", "3000"),
+		DBPath:         getEnvOrDefault("DB_PATH", "data.db"),
+		AppviewURL:     getEnvOrDefault("APPVIEW_URL", ""),
+		FrontendURL:    getEnvOrDefault("FRONTEND_URL", ""),
+		PLCUrl:         getEnvOrDefault("ATPROTO_PLC_URL", ""),
 	}
 
 	db, err := sql.Open("sqlite3", config.DBPath)
@@ -554,7 +506,6 @@ func main() {
 	// Middleware
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
-	r.Use(requestDebugMiddleware())
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{config.AppviewURL, config.FrontendURL},
@@ -563,12 +514,12 @@ func main() {
 		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
 		AllowCredentials: true,
 		AllowOriginFunc: func(origin string) bool {
-			return origin == config.AppviewURL
+			return origin == config.AppviewURL || origin == config.FrontendURL
 		},
 		MaxAge: 12 * time.Hour,
 	}))
 
-	serviceWebDID := "did:web:" + config.ServerURL
+	serviceWebDID := "did:web:" + config.ServerHostname
 	auther, err := NewAuth(
 		100_000,
 		time.Hour*12,
@@ -592,7 +543,7 @@ func main() {
 		c.String(200, "https://github.com/lun-4/douga -- a reimplementation of video.bsky.app for the bit")
 	})
 	r.GET("/.well-known/did.json", func(c *gin.Context) {
-		didDoc := newDIDDocument(config.ServerURL)
+		didDoc := newDIDDocument(config.ServerHostname)
 		c.JSON(200, didDoc)
 	})
 
