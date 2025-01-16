@@ -267,6 +267,7 @@ func (s *State) getJobStatus(c *gin.Context) {
 type ConversionManager struct {
 	mu            sync.RWMutex
 	conversions   sync.Map
+	thumbnails    sync.Map
 	cleanupTicker *time.Ticker
 	config        Config
 }
@@ -275,6 +276,13 @@ type Conversion struct {
 	OutputDir    string
 	LastAccessed time.Time
 	Converting   bool
+	Error        error
+}
+
+type Thumbnail struct {
+	Path         string
+	LastAccessed time.Time
+	Generating   bool
 	Error        error
 }
 
@@ -292,6 +300,8 @@ func (cm *ConversionManager) cleanupRoutine() {
 	for range cm.cleanupTicker.C {
 		cm.mu.Lock()
 		now := time.Now()
+
+		// Cleanup conversions
 		keysToRemove := make([]string, 0)
 		cm.conversions.Range(func(keyA any, convA any) bool {
 			key := keyA.(string)
@@ -306,8 +316,99 @@ func (cm *ConversionManager) cleanupRoutine() {
 		for _, k := range keysToRemove {
 			cm.conversions.Delete(k)
 		}
+
+		// Cleanup thumbnails
+		thumbsToRemove := make([]string, 0)
+		cm.thumbnails.Range(func(keyA any, thumbA any) bool {
+			key := keyA.(string)
+			thumb := thumbA.(*Thumbnail)
+
+			if now.Sub(thumb.LastAccessed) > 30*time.Minute {
+				thumbsToRemove = append(thumbsToRemove, key)
+				os.RemoveAll(filepath.Dir(thumb.Path))
+			}
+			return true
+		})
+		for _, k := range thumbsToRemove {
+			cm.thumbnails.Delete(k)
+		}
+
 		cm.mu.Unlock()
 	}
+}
+
+// Add this method to ConversionManager
+func (cm *ConversionManager) getOrCreateThumbnail(did, cid string) (*Thumbnail, error) {
+	key := fmt.Sprintf("thumb_%s_%s", did, cid)
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if thumbA, exists := cm.thumbnails.Load(key); exists {
+		thumb := thumbA.(*Thumbnail)
+		thumb.LastAccessed = time.Now()
+		return thumb, nil
+	}
+
+	// Create new temporary directory for thumbnail
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("thumb_%s_%s_*", did, cid))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp directory for thumbnail: %w", err)
+	}
+
+	thumb := &Thumbnail{
+		Path:         filepath.Join(tmpDir, "thumbnail.jpg"),
+		LastAccessed: time.Now(),
+		Generating:   false,
+	}
+	cm.thumbnails.Store(key, thumb)
+	return thumb, nil
+}
+
+// Add thumbnail generation method
+func (cm *ConversionManager) generateThumbnail(did, cid string, thumb *Thumbnail) error {
+	cm.mu.Lock()
+	if thumb.Generating {
+		cm.mu.Unlock()
+		return nil // Generation already in progress
+	}
+	thumb.Generating = true
+	cm.mu.Unlock()
+
+	defer func() {
+		cm.mu.Lock()
+		thumb.Generating = false
+		cm.mu.Unlock()
+	}()
+
+	sourceURL := fmt.Sprintf("%s/blob/%s/%s", cm.config.AppviewURL, did, cid)
+
+	// Download blob to temporary storage
+	tmpFile, err := cm.downloadBlob(sourceURL)
+	if err != nil {
+		thumb.Error = fmt.Errorf("failed to download blob for thumbnail: %w", err)
+		return thumb.Error
+	}
+	defer os.Remove(tmpFile)
+
+	// Generate thumbnail using ffmpeg
+	// This command will extract a frame at 1 second mark and create a thumbnail
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", tmpFile,
+		"-ss", "00:00:01.000",
+		"-vframes", "1",
+		"-vf", "scale=480:-1",
+		"-y",
+		thumb.Path,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		thumb.Error = fmt.Errorf("ffmpeg thumbnail error: %v, output: %s", err, output)
+		return thumb.Error
+	}
+
+	return nil
 }
 
 func (cm *ConversionManager) getOrCreateConversion(did, cid string) (*Conversion, error) {
@@ -415,7 +516,7 @@ func (cm *ConversionManager) convertToHLS(did, cid string, conv *Conversion) err
 	return nil
 }
 
-func (s *State) getVideo(c *gin.Context) {
+func (s *State) getVideoOrThumbnail(c *gin.Context) {
 	did := c.Param("did")
 	cid := c.Param("cid")
 	if did == "" {
@@ -428,6 +529,10 @@ func (s *State) getVideo(c *gin.Context) {
 	}
 
 	filename := filepath.Base(c.Param("filepath"))
+	if filename == "thumbnail.jpg" {
+		s.getThumbnail(c)
+		return
+	}
 
 	// Validate that we're only serving allowed files
 	if filename != "playlist.m3u8" && filepath.Ext(filename) != ".ts" {
@@ -460,6 +565,43 @@ func (s *State) getVideo(c *gin.Context) {
 
 	// Serve the file
 	c.File(filepath.Join(conv.OutputDir, filename))
+}
+
+// Add getThumbnail handler to State
+func (s *State) getThumbnail(c *gin.Context) {
+	did := c.Param("did")
+	cid := c.Param("cid")
+
+	if did == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("did is missing"))
+		return
+	}
+	if cid == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("cid is missing"))
+		return
+	}
+
+	thumb, err := s.cm.getOrCreateThumbnail(did, cid)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
+	// Check if we need to generate thumbnail
+	if _, err := os.Stat(thumb.Path); os.IsNotExist(err) {
+		if err := s.cm.generateThumbnail(did, cid, thumb); err != nil {
+			c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	// Set appropriate headers
+	c.Header("Content-Type", "image/jpeg")
+	c.Header("Cache-Control", "public, max-age=31536000")
+	c.Header("Access-Control-Allow-Origin", "*")
+
+	// Serve the thumbnail
+	c.File(thumb.Path)
 }
 
 func main() {
@@ -536,8 +678,7 @@ func main() {
 	r.POST("/xrpc/app.bsky.video.uploadVideo", state.uploadVideo)
 
 	// TODO implement
-	r.GET("/watch/:did/:cid/*filepath", state.getVideo)
-	//r.GET("/watch/{did}/{cid}/thumbnail.jpg", state.getThumbnail)
+	r.GET("/watch/:did/:cid/*filepath", state.getVideoOrThumbnail)
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(200, "https://github.com/lun-4/douga -- a reimplementation of video.bsky.app for the bit")
