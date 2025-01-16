@@ -7,7 +7,7 @@ keep in mind that at the moment (january 2025), bsky video is a centralized serv
 in turn, to make this work within the atproto mainnet, you and your friends need to use the same build of social-app
 that uses your own video service. more information in the **how** section
 
-![video recording of it working](https://smooch.computer/i/bmd9paf76z2.mp4)
+[![Watch the video](https://smooch.computer/i/yjm4k7tjtfyo5.png)](https://smooch.computer/i/bmd9paf76z2.mp4)
 
 ## how
 
