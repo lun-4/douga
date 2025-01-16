@@ -9,6 +9,8 @@ that uses your own video service. more information in the **how** section
 
 [![Watch the video](https://smooch.computer/i/yjm4k7tjtfyo5.png)](https://smooch.computer/i/bmd9paf76z2.mp4)
 
+_playing: [Lone - Backtail Was Heavy (Last.fm Sessions)](https://www.youtube.com/watch?v=G1ejel4o45w)_
+
 ## how
 
 - get go1.23 because indigo depends on it: https://go.dev/dl/
