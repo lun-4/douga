@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +27,12 @@ import (
 )
 
 type Config struct {
-	ServerURL  string
-	Port       string
-	DBPath     string
-	AppviewURL string
-	PLCUrl     string
+	ServerURL   string
+	Port        string
+	DBPath      string
+	AppviewURL  string
+	FrontendURL string
+	PLCUrl      string
 }
 
 type DIDDocument struct {
@@ -105,6 +108,7 @@ func (st Storage) fetchUser(userDID string) (*User, error) {
 type State struct {
 	storage *Storage
 	jobs    sync.Map
+	cm      *ConversionManager
 }
 
 func (s *State) getUploadLimits(c *gin.Context) {
@@ -260,6 +264,204 @@ func (s *State) getJobStatus(c *gin.Context) {
 	c.JSON(200, out)
 }
 
+type ConversionManager struct {
+	mu            sync.RWMutex
+	conversions   sync.Map
+	cleanupTicker *time.Ticker
+	config        Config
+}
+
+type Conversion struct {
+	OutputDir    string
+	LastAccessed time.Time
+	Converting   bool
+	Error        error
+}
+
+func NewConversionManager(config Config) *ConversionManager {
+	cm := &ConversionManager{
+		conversions:   sync.Map{},
+		cleanupTicker: time.NewTicker(5 * time.Minute),
+		config:        config,
+	}
+	go cm.cleanupRoutine()
+	return cm
+}
+
+func (cm *ConversionManager) cleanupRoutine() {
+	for range cm.cleanupTicker.C {
+		cm.mu.Lock()
+		now := time.Now()
+		keysToRemove := make([]string, 0)
+		cm.conversions.Range(func(keyA any, convA any) bool {
+			key := keyA.(string)
+			conv := convA.(*Conversion)
+
+			if now.Sub(conv.LastAccessed) > 30*time.Minute {
+				keysToRemove = append(keysToRemove, key)
+				os.RemoveAll(conv.OutputDir)
+			}
+			return true
+		})
+		for _, k := range keysToRemove {
+			cm.conversions.Delete(k)
+		}
+		cm.mu.Unlock()
+	}
+}
+
+func (cm *ConversionManager) getOrCreateConversion(did, cid string) (*Conversion, error) {
+	key := fmt.Sprintf("%s/%s", did, cid)
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if convA, exists := cm.conversions.Load(key); exists {
+		conv := convA.(*Conversion)
+		conv.LastAccessed = time.Now()
+		return conv, nil
+	}
+
+	// Create new temporary directory
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("hls_%s_%s_*", did, cid))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	conv := &Conversion{
+		OutputDir:    tmpDir,
+		LastAccessed: time.Now(),
+		Converting:   false,
+	}
+	cm.conversions.Store(key, conv)
+	return conv, nil
+}
+
+func (cm *ConversionManager) downloadBlob(sourceURL string) (string, error) {
+	// Create temporary file for the downloaded blob
+	tmpFile, err := os.CreateTemp("", "blob_*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	// Download the blob
+	resp, err := http.Get(sourceURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to download blob: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download blob: HTTP %d", resp.StatusCode)
+	}
+
+	// Copy the blob to temporary file
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to save blob: %w", err)
+	}
+
+	return tmpFile.Name(), nil
+}
+
+func (cm *ConversionManager) convertToHLS(did, cid string, conv *Conversion) error {
+	cm.mu.Lock()
+	if conv.Converting {
+		cm.mu.Unlock()
+		return nil // Conversion already in progress
+	}
+	conv.Converting = true
+	cm.mu.Unlock()
+
+	defer func() {
+		cm.mu.Lock()
+		conv.Converting = false
+		cm.mu.Unlock()
+	}()
+
+	sourceURL := fmt.Sprintf("%s/blob/%s/%s", cm.config.AppviewURL, did, cid)
+
+	// Download blob to temporary storage
+	tmpFile, err := cm.downloadBlob(sourceURL)
+	if err != nil {
+		conv.Error = fmt.Errorf("failed to download blob: %w", err)
+		return conv.Error
+	}
+	// Clean up the temporary file when done
+	defer os.Remove(tmpFile)
+
+	log.Printf("Converted %s to HLS", cid)
+	log.Printf("temp stored at: %s", tmpFile)
+
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", tmpFile,
+		"-profile:v", "baseline",
+		"-level", "3.0",
+		"-start_number", "0",
+		"-hls_time", "10", // TODO segment length configurable?
+		"-hls_list_size", "0",
+		"-f", "hls",
+		"-hls_segment_filename", filepath.Join(conv.OutputDir, "segment%d.ts"),
+		filepath.Join(conv.OutputDir, "playlist.m3u8"),
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		conv.Error = fmt.Errorf("ffmpeg error: %v, output: %s", err, output)
+		return conv.Error
+	}
+
+	return nil
+}
+
+func (s *State) getVideo(c *gin.Context) {
+	did := c.Param("did")
+	cid := c.Param("cid")
+	if did == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("did is missing"))
+		return
+	}
+	if cid == "" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("cid is missing"))
+		return
+	}
+
+	filename := filepath.Base(c.Param("filepath"))
+
+	// Validate that we're only serving allowed files
+	if filename != "playlist.m3u8" && filepath.Ext(filename) != ".ts" {
+		c.AbortWithError(http.StatusBadRequest, errors.New("invalid file request"))
+		return
+	}
+
+	conv, err := s.cm.getOrCreateConversion(did, cid)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
+	// Check if we need to start conversion
+	if _, err := os.Stat(filepath.Join(conv.OutputDir, "playlist.m3u8")); os.IsNotExist(err) {
+		if err := s.cm.convertToHLS(did, cid, conv); err != nil {
+			c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	// Set appropriate headers
+	if filepath.Ext(filename) == ".m3u8" {
+		c.Header("Content-Type", "application/vnd.apple.mpegurl")
+	} else {
+		c.Header("Content-Type", "video/mp2t")
+	}
+
+	c.Header("Access-Control-Allow-Origin", "*")
+
+	// Serve the file
+	c.File(filepath.Join(conv.OutputDir, filename))
+}
+
 func requestDebugMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get the raw request body
@@ -311,11 +513,12 @@ func requestDebugMiddleware() gin.HandlerFunc {
 func main() {
 	// Initialize configuration
 	config := Config{
-		ServerURL:  getEnvOrDefault("SERVER_URL", "chat.example.net"),
-		Port:       getEnvOrDefault("PORT", "3000"),
-		DBPath:     getEnvOrDefault("DB_PATH", "data.db"),
-		AppviewURL: getEnvOrDefault("APPVIEW_URL", ""),
-		PLCUrl:     getEnvOrDefault("ATPROTO_PLC_URL", ""),
+		ServerURL:   getEnvOrDefault("SERVER_URL", "chat.example.net"),
+		Port:        getEnvOrDefault("PORT", "3000"),
+		DBPath:      getEnvOrDefault("DB_PATH", "data.db"),
+		AppviewURL:  getEnvOrDefault("APPVIEW_URL", ""),
+		FrontendURL: getEnvOrDefault("FRONTEND_URL", ""),
+		PLCUrl:      getEnvOrDefault("ATPROTO_PLC_URL", ""),
 	}
 
 	db, err := sql.Open("sqlite3", config.DBPath)
@@ -342,7 +545,8 @@ func main() {
 	}
 
 	storage := Storage{db: db, appviewUrl: config.AppviewURL, plcUrl: config.PLCUrl}
-	state := State{storage: &storage}
+	cm := NewConversionManager(config)
+	state := State{storage: &storage, cm: cm}
 
 	// Create Gin router
 	r := gin.New()
@@ -353,7 +557,7 @@ func main() {
 	r.Use(requestDebugMiddleware())
 
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{config.AppviewURL},
+		AllowOrigins:     []string{config.AppviewURL, config.FrontendURL},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH"},
 		AllowHeaders:     []string{"Origin", "Authorization", "atproto-accept-labelers", "content-type", "content-length"},
 		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
@@ -381,8 +585,8 @@ func main() {
 	r.POST("/xrpc/app.bsky.video.uploadVideo", state.uploadVideo)
 
 	// TODO implement
-	r.GET("/watch/{did}/{cid}/playlist.m3u8", state.getVideo)
-	r.GET("/watch/{did}/{cid}/thumbnail.jpg", state.getThumbnail)
+	r.GET("/watch/:did/:cid/*filepath", state.getVideo)
+	//r.GET("/watch/{did}/{cid}/thumbnail.jpg", state.getThumbnail)
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(200, "https://github.com/lun-4/douga -- a reimplementation of video.bsky.app for the bit")
