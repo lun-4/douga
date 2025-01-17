@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ type Config struct {
 	AppviewURL     string
 	FrontendURL    string
 	PLCUrl         string
+	AllowedDIDs    string
 }
 
 type DIDDocument struct {
@@ -106,17 +108,23 @@ func (st Storage) fetchUser(userDID string) (*User, error) {
 }
 
 type State struct {
-	storage *Storage
-	jobs    sync.Map
-	cm      *ConversionManager
+	storage     *Storage
+	jobs        sync.Map
+	cm          *ConversionManager
+	allowedDIDs []string
 }
 
 func (s *State) getUploadLimits(c *gin.Context) {
-	// userDID := c.GetString("user_did")
+	userDID := c.GetString("user_did")
 	out := bsky.VideoGetUploadLimits_Output{
 		CanUpload:            true,
 		RemainingDailyBytes:  lo.ToPtr(int64(10000000)),
 		RemainingDailyVideos: lo.ToPtr(int64(2000)),
+	}
+	if len(s.allowedDIDs) > 0 && !slices.Contains(s.allowedDIDs, userDID) {
+		out.CanUpload = false
+		out.RemainingDailyBytes = lo.ToPtr(int64(0))
+		out.RemainingDailyVideos = lo.ToPtr(int64(0))
 	}
 
 	c.JSON(200, out)
@@ -186,6 +194,10 @@ func (s *State) processJob(job Job, body []byte) error {
 func (s *State) uploadVideo(c *gin.Context) {
 	// userDID := c.GetString("user_did")
 	userDID := c.Query("did")
+	if len(s.allowedDIDs) > 0 && !slices.Contains(s.allowedDIDs, userDID) {
+		c.AbortWithError(http.StatusForbidden, fmt.Errorf("DID not allowed"))
+		return
+	}
 	jobID := gonanoid.MustGenerate("abcdefghimnopqrstuvwxyz1234567890", 10)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -613,6 +625,7 @@ func main() {
 		AppviewURL:     getEnvOrDefault("APPVIEW_URL", ""),
 		FrontendURL:    getEnvOrDefault("FRONTEND_URL", ""),
 		PLCUrl:         getEnvOrDefault("ATPROTO_PLC_URL", ""),
+		AllowedDIDs:    getEnvOrDefault("ALLOWED_DIDS", ""),
 	}
 
 	db, err := sql.Open("sqlite3", config.DBPath)
@@ -638,9 +651,16 @@ func main() {
 		log.Fatalf("Error creating tables: %v", err)
 	}
 
+	allowedDIDs := make([]string, 0)
+	if config.AllowedDIDs != "" {
+		for _, did := range strings.Split(config.AllowedDIDs, ",") {
+			allowedDIDs = append(allowedDIDs, did)
+		}
+	}
+
 	storage := Storage{db: db, appviewUrl: config.AppviewURL, plcUrl: config.PLCUrl}
 	cm := NewConversionManager(config)
-	state := State{storage: &storage, cm: cm}
+	state := State{storage: &storage, cm: cm, allowedDIDs: allowedDIDs}
 
 	// Create Gin router
 	r := gin.New()
