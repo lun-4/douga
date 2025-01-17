@@ -539,6 +539,10 @@ func (s *State) getVideoOrThumbnail(c *gin.Context) {
 		c.AbortWithError(http.StatusBadRequest, errors.New("cid is missing"))
 		return
 	}
+	if len(s.allowedDIDs) > 0 && !slices.Contains(s.allowedDIDs, did) {
+		c.AbortWithError(http.StatusForbidden, fmt.Errorf("DID not allowed"))
+		return
+	}
 
 	filename := filepath.Base(c.Param("filepath"))
 	if filename == "thumbnail.jpg" {
